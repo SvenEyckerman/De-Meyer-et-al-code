@@ -35,4 +35,4 @@ Margaux De Meyer<sup>1,2,3</sup>, Annick Verhee<sup>1,2</sup>, Hanna Grzesik<sup
 ## Contents
 
 The Rmd script can be found under 'analysis', as well as an html knit.
-The input data can be found under 'data'. These excel files are used in the R script. 
+The input data can be found under 'data'. The excel files there are used in the R script. 
