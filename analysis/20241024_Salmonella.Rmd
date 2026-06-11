@@ -1,0 +1,341 @@
+---
+title: "20241024_Salmonella"
+author: "L. Meuris"
+date: "2024-10-24"
+output: html_document
+---
+
+# Introduction
+
+Context: Salmonella infection. Salmonella induces cellular uptake to escape the immune system. After uptake, it stimulates formation of a vacuole, which is lysosome-like but has active exclusion of M6P proteins. A part of the cells also replicate in the cytoplasm, and this pool contributes mostly to new infection cycles. 
+
+The current experiment has the number of Salmonella cells per Strain cell after a certain time as the readout (response variable). The question is whether different siRNA's (explanatory variable) influence the number Salmonella bacteria per Strain cell.
+
+There are 3 biological replicates per siRNA (3 independent experiments). The control setup, with an irrelevant siRNA, was done in 3 technical replicates within each biological replicate. Each experiment was done in a 96-well plate, with the outer wells filled with buffer (1 row/column), while only using the inner wells for experimental conditions. The siRNA were added row by row with a multichannel pipette, resulting in batches of 10 conditions being clustered together, each time containing 9 experimental siRNAs and one control well.
+
+Also, one set of measurements was done in WT Strain cells, and another set in sopB deficient Strain cells. 
+
+There are quite a high number of cells in each well that did not take up any Salmonella bacteria. 
+
+Potential issues to take into account: 
+  - How to handle technical replicates for control setup? Mean or multilevel model? 
+  - Experiment effects? Multichannel pipetting effect? Probably not a row/column effect as such, since we don't necessarily expect row B in experiment 1 and row B in experiment 2 to have the same/similar effect. However, within an experiment, all wells of row B/C/D were pipetted in the same step. So we will probably have to include a 9-level factor, coding for 3 rows within 3 experiments. Do we also need an overarching experiment effect (rows nested within experiment)?  
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = TRUE, message = TRUE)
+here::i_am("analysis/20241024_Salmonella.Rmd")
+library(here)
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(forcats)
+library(tidyr)
+
+#library(purr)
+library(lme4)
+library(multcomp)
+select <- dplyr::select
+
+library(clubSandwich)
+library(broom)
+library(DHARMa)
+```
+
+# Data
+
+The data are delivered as an excel file with 4 tabs. Tabs 1-3 are the experimental data, in which each column corresponds to a well in a 96-well plate. In each well, a certain number of cells have been observed and then the number of Salmonellae per cell have been counted. In other words, each cell in the excel sheet is an observation of a number of intracellular Salmonellae. The 4th and last tab contains the info about the siRNA treatments. 
+
+For convenience, we split the excel file in two, one containing all the counts in 3 tabs, and the other file containing the treatment information in an easily readable format. Then we read in the data. 
+
+```{r}
+data_treat <- read_xlsx(here('data/Treatments.xlsx')) 
+
+sheets <- excel_sheets(here('data/Counts.xlsx'))
+
+data_exp1 <- read_xlsx(here('data/Counts.xlsx'), sheet = sheets[1]) %>%
+  pivot_longer(cols = everything(), names_to = 'Well', values_to = 'Counts') %>%
+  filter(!is.na(Counts)) %>%
+  mutate(Experiment = 1)
+data_exp2 <- read_xlsx(here('data/Counts.xlsx'), sheet = sheets[2]) %>%
+  pivot_longer(cols = everything(), names_to = 'Well', values_to = 'Counts') %>%
+  filter(!is.na(Counts)) %>%
+  mutate(Experiment = 2)
+data_exp3 <- read_xlsx(here('data/Counts.xlsx'), sheet = sheets[3]) %>%
+  pivot_longer(cols = everything(), names_to = 'Well', values_to = 'Counts') %>%
+  filter(!is.na(Counts)) %>%
+  mutate(Experiment = 3)
+
+data_counts <- bind_rows(data_exp1, data_exp2, data_exp3)
+
+data <- left_join(data_counts, data_treat) %>%
+  mutate(Strain = factor(str_extract(ID, '.+(?=\\_)')),
+         siRNA = factor(str_extract(ID, '(?<=\\_).+')),
+         ID = paste0(ID, '_Exp', Experiment),
+         Experiment = factor(Experiment),
+         Row = str_extract(Well, '\\D'),
+         Block = factor(paste0('Exp', Experiment, '_Row', Row)), 
+         siRNA = relevel(siRNA, ref = 'Non-Tar'),
+         Strain = relevel(Strain, ref = 'SL1344-WT'),
+         Category = factor(
+           case_when(
+             Counts == 0 ~ '0', 
+             Counts == 1 ~ '1',
+             Counts >= 2 & Counts <= 10 ~ '2-10',
+             Counts >= 11 & Counts <= 30 ~ '11-30',
+             Counts > 30 ~ 'Over 30'),
+           levels = c('0', '1', '2-10', '11-30', 'Over 30'), ordered = T)) %>%
+  select(Strain, siRNA, Experiment, ID, Block, Well, Row, Counts, Category) %>%
+  mutate()
+
+rm(data_counts, data_exp1, data_exp2, data_exp3, data_treat, sheets)
+gc()
+```
+
+# New analysis 10/2024
+
+Researcher asked a new question for the same dataset: 
+
+  - Is there a difference in fraction of intracellular populations when comparing a siRNA vs Non-Tar within a strain?
+  - Is there a difference in fraction of intracellular populations when comparing a WT vs Mutant strain using the same siRNA?
+  
+Researcher wants to work with categories, if these are discernible.
+
+When looking at the previous analysis (20231115_Salmonella.Rmd), this turns out not to be the case. There is no bimodal or multimodal distribution of Salmonella counts. Categorization is thus not data driven. For the models below, we stick to modeling the raw data and not the derived (categorized) data. 
+
+The figure below shows the distributions for categories as indicated in the legend. 
+
+```{r}
+data %>%
+  group_by(Strain, siRNA, Category) %>%
+  tally() %>%
+  ungroup() %>%
+  group_by(Strain, siRNA) %>% 
+  reframe(Category = Category,
+            freq = n/sum(n)) %>%
+  ggplot(aes(x = siRNA, fill = Category, y = freq)) +
+  geom_col(position = 'dodge') +
+  facet_wrap(~Strain, nrow = 2) +
+  scale_y_sqrt() +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+Such data could in principle be analyzed with a proportional odds model for ordinal responses, but as stated this reduces the data and will most probably result in similar outcomes as a model that uses the raw data. 
+
+As before: we may want to model possible block or experiment effects. 
+
+## Modeling the raw data
+
+### Prepare data
+
+First we calculate summarized data again. 
+This time, we will first log transform, since we have skewed data.
+Log transformation should dampen the impact of outliers and skewness.
+
+```{r}
+data_summ <- data %>%
+  filter(Counts >= 2 & Counts < 30) %>%
+  mutate(lCounts = log2(Counts)) %>%
+  group_by(Strain, siRNA, Experiment, Block) %>%
+  summarise(mlCounts = mean(lCounts)) %>%
+  mutate(absCounts = 2^mlCounts) %>%
+  droplevels()
+```
+
+### Model
+
+The model will contain fixed effects for siRNA, Strain and their interaction. These are the effects we are interested in. 
+Further, we will add a random effect for each Experiment/Block, these are uncorrelated random intercepts, a classical multilevel model.
+(Note that we do not include Well, since the data are summarized on that level; i.e. each Well is a single observation).
+
+Note: since the data are coded such that each block has a unique name and can only belong to one experiment, this is automatically a nested design. If the data would be coded such that each block does not have a unique name, then we would need to make the nesting explicit in the model as: 
+(1|Experiment/Block) or (1|Experiment) + (1|Experiment:Block). For the wells this is the case, so we will make the nesting explicit. 
+
+```{r}
+mmod <- lmer(data = data_summ, mlCounts ~ Strain*siRNA + (1|Experiment/Block))
+mmod %>% summary
+```
+
+Simulated residual analysis for this model (DHARMa package). 
+
+```{r}
+simresid <- simulateResiduals(mmod)
+plot(simresid)
+plotResiduals(simresid, form = data_summ$siRNA)
+```
+
+We see potentially some problems with variance heterogenetity, although the DHARMa analysis did not flag significant problems. We may have some siRNAs that have higher variance than others. Robust variance estimators in the inference will help. Residuals look good.
+
+Have a look at model predictions. 
+```{r}
+data_augmented <- left_join(
+  data_summ,
+  HLMdiag::hlm_resid(mmod, standardize = TRUE) %>%
+    select(fittedPopulation = .mar.fitted,
+           fittedIndividual = .fitted, 
+           everything()))
+
+data_augmented %>%
+  group_by(Strain, siRNA) %>%
+  summarize(mmlCounts = mean(mlCounts),
+            selCounts = sd(mlCounts)/sqrt(sum(!is.na(mlCounts)))
+  ) %>%
+  ggplot(aes(x = fct_reorder(siRNA, mmlCounts), y = 2^mmlCounts)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = 2^(mmlCounts-selCounts), 
+                    ymax = 2^(mmlCounts+selCounts))) +
+  theme_bw() +
+  geom_point(aes(x = siRNA, y = 2^fittedPopulation), color = 'red', data = data_augmented) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  labs(y = 'Geometric mean number of Salmonellae per cell', x = '') +
+  facet_wrap(~Strain)
+```
+
+Model predictions (in red) vs. mean log2(Counts) with standard errors (in black). 
+Here again, we see some groups with high variance. Most model predictions are quite good.
+In the mutant strain we see some model predictions that are off. 
+This is probably due to corrections from the random effect.
+What if we look at predictions at the random effect level (i.e. taking into account the random effect of experiment and block)? 
+
+
+```{r}
+data_augmented %>%
+  group_by(Strain, siRNA) %>%
+  summarize(mmlCounts = mean(mlCounts),
+            selCounts = sd(mlCounts)/sqrt(sum(!is.na(mlCounts)))
+  ) %>%
+  ggplot(aes(x = fct_reorder(siRNA, mmlCounts), y = mmlCounts)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mmlCounts-selCounts, 
+                    ymax = mmlCounts+selCounts)) +
+  theme_bw() +
+  geom_point(aes(x = siRNA, y = fittedIndividual, color = Experiment), data = data_augmented) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  labs(y = 'mean log2 Counts', x = '') +
+  facet_wrap(~Strain)
+
+data_augmented %>%
+  group_by(Strain, siRNA) %>%
+  summarize(mmlCounts = mean(mlCounts),
+            selCounts = sd(mlCounts)/sqrt(sum(!is.na(mlCounts)))
+  ) %>%
+  ggplot(aes(x = fct_reorder(siRNA, mmlCounts), y = mmlCounts)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = mmlCounts-selCounts, 
+                    ymax = mmlCounts+selCounts)) +
+  theme_bw() +
+  geom_point(aes(x = siRNA, y = fittedIndividual, color = Block), data = data_augmented) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1)) +
+  labs(y = 'mean log2 Counts', x = '') +
+  facet_wrap(~Strain)
+```
+
+This is spot on. Colors are indicating the (nested) random effects. Same colors should be adjusted in the same direction.
+
+### Inference
+
+Now with a good model, we will evaluate the requested contrasts. 
+First: overall effects (omnibus tests), testing main and interaction effect together.
+
+```{r}
+mmod_noStrain <- lmer(data = data_summ, mlCounts ~ siRNA + (1|Experiment/Block))
+anova(mmod, mmod_noStrain)
+```
+
+Strain is not significant, so in principle we would not continue with testing strain effects. 
+(See below for further code).
+
+siRNA effect? 
+
+```{r}
+mmod_nosiRNA <- lmer(data = data_summ, mlCounts ~ Strain + (1|Experiment/Block))
+anova(mmod, mmod_nosiRNA)
+```
+
+siRNA effect is highly significant, meaning at least one of the siRNA's has an effect on the log2 counts. 
+
+Next, we construct the contrasts for all siRNAs against Non-Tar, both in WT and DsopB. 
+
+To do so, we write functions to extract the correct parameters.
+
+```{r}
+contraster_siRNA <- function(obj, strain, sirna) {
+  coefnames <- coef(summary(obj)) %>% rownames
+  x <- paste0('siRNA', sirna)
+  y <- paste0('StrainSl1344-dsopB:siRNA', sirna)
+  if (strain == 'WT') {
+    out <- (coefnames == x) %>% as.numeric
+  } else if (strain == 'Mutant') {
+    out <- (coefnames == x | coefnames == y) %>% as.numeric 
+  }
+  out
+  }
+
+contraster_strain <- function(obj, sirna) {
+  coefnames <- coef(summary(obj)) %>% rownames
+  x <- 'StrainSl1344-dsopB'
+  y <- paste0('StrainSl1344-dsopB:siRNA', sirna) 
+  (coefnames == x | coefnames == y) %>% as.numeric
+  }
+```
+
+Construct contrast matrix for use with multcomp
+
+```{r}
+L <- rbind(
+  (coef(summary(mmod)) %>% rownames == '(Intercept)') %>% as.numeric, 
+  (coef(summary(mmod)) %>% rownames %in% c('(Intercept)', 'StrainSl1344-dsopB')) %>% as.numeric,
+  sapply(c('HGS', 'PTPN23', 'STAM', 'STAM2', 'VPS26A', 'VPS29', 'VPS35','ZFYVE16'), 
+       FUN = contraster_siRNA, 
+       obj = mmod, strain = 'WT', 
+       simplify = TRUE) %>% t,
+  sapply(c('HGS', 'PTPN23', 'STAM', 'STAM2', 'VPS26A', 'VPS29', 'VPS35','ZFYVE16'), 
+       FUN = contraster_siRNA, 
+       obj = mmod, strain = 'Mutant', 
+       simplify = TRUE) %>% t,
+  sapply(c('Non-Tar', 'HGS', 'PTPN23', 'STAM', 'STAM2', 'VPS26A', 'VPS29', 'VPS35','ZFYVE16'), 
+       FUN = contraster_strain, 
+       obj = mmod, 
+       simplify = TRUE) %>% t
+)
+
+colnames(L) <- coef(summary(mmod)) %>% rownames
+
+rownames(L) <- c(
+  'Geometric avg. number of Salmonellae for WT, Non-Tar',
+  'Geometric avg. number of Salmonellae for DsopB, Non-Tar',
+  paste0('Ratio of Salmonellae in ', c('HGS', 'PTPN23', 'STAM', 'STAM2', 'VPS26A', 'VPS29', 'VPS35','ZFYVE16'), ' vs. Non-Tar in WT strain'),
+  paste0('Ratio of Salmonellae in ', c('HGS', 'PTPN23', 'STAM', 'STAM2', 'VPS26A', 'VPS29', 'VPS35','ZFYVE16'), ' vs. Non-Tar in DsopB strain'),
+  paste0('Ratio of Salmonellae in DsopB vs WT strain for ', c('Non-Tar', 'HGS', 'PTPN23', 'STAM', 'STAM2', 'VPS26A', 'VPS29', 'VPS35','ZFYVE16'))
+)
+```
+
+
+```{r}
+multcompobj <- glht(mmod, linfct = L, vcov = vcovCR, type = 'CR0')
+
+table <- left_join(
+    multcompobj %>% summary %>% tidy,
+    multcompobj %>% confint %>% tidy
+  ) %>%
+    mutate(`Adj. p-value` = ifelse(adj.p.value < 0.001, 
+                                   "<0.001", round(adj.p.value, 3)),
+           Estimate = 2^(estimate),
+           conf.low = 2^conf.low,
+           conf.high = 2^conf.high) %>%
+    mutate(across(where(is.numeric)) %>% round(., 2)) %>%
+    select(-null.value) %>%
+    select(Contrast = contrast,
+           Estimate,
+           `Adj. p-value`,
+           `95% CI, lower` = conf.low,
+           `95% CI, upper` = conf.high)
+
+knitr::kable(table) %>% kableExtra::kable_styling()
+```
+
+```{r}
+sessionInfo()
+```
+
